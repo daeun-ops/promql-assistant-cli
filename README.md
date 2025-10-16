@@ -1,4 +1,11 @@
 # promql-assistant-cli
+<!-- Badges -->
+![CI](https://github.com/daeun-ops/promql-assistant-cli/actions/workflows/ci.yml/badge.svg)
+![Docs](https://img.shields.io/badge/docs-mkdocs--material-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Contributions welcome](https://img.shields.io/badge/contributions-welcome-brightgreen)
+![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)
+
 
 Describe what you want → get **valid PromQL** instantly.  
 100% local-first, scriptable, and CI-friendly.
