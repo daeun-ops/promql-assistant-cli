@@ -1,0 +1,7 @@
+[project]
+name = "promql-assistant"
+version = "0.1.0"
+description = "Natural language → PromQL CLI tool"
+authors = [{ name = "Daeun Kim", email = "daeun@example.com" }]
+dependencies = ["click", "requests", "rich"]
+requires-python = ">=3.9"
