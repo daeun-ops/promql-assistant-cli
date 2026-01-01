@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from .errors import RuleMatchError
+from .rules_loader import Rule, load_packaged_rules, match_rule, render_template
 from .util import parse_duration_to_seconds
 
 
@@ -17,11 +18,14 @@ class RuleResult:
     confidence: float = 0.7
 
 
+_DURATION_RE = re.compile(r"^\s*(\d+)\s*([smhdwy])\s*$", re.IGNORECASE)
+
+
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
-def _extract_range(text: str, default: str = "5m") -> str:
+def _extract_range_from_text(text: str, default: str = "5m") -> str:
     """
     Extract 'last 30m', '지난 30분', '최근 1h' etc.
     Supports 30s/5m/1h/7d.
@@ -64,9 +68,22 @@ def _extract_quantile(text: str, default: float = 0.95) -> float:
     return default
 
 
+def _validate_range(range_str: str, warnings: List[str]) -> str:
+    try:
+        _ = parse_duration_to_seconds(range_str)
+        return range_str
+    except Exception:
+        warnings.append(f"Could not parse range {range_str!r}; falling back to 5m.")
+        return "5m"
+
+
 def convert_to_promql(
     prompt: str,
     *,
+    # hard override from CLI (real option)
+    range_override: Optional[str] = None,
+    quantile_override: Optional[float] = None,
+    # config mappings
     cpu_usage_metric: str,
     mem_working_set_metric: str,
     http_requests_total_metric: str,
@@ -76,90 +93,57 @@ def convert_to_promql(
     label_service: str,
 ) -> RuleResult:
     """
-    Rule-based NL -> PromQL conversion.
-    Keeps it deterministic and local-first.
+    YAML-rule based NL -> PromQL conversion.
+    Deterministic and local-first.
     """
-    text = _norm(prompt)
-    rng = _extract_range(prompt, default="5m")
     warnings: List[str] = []
+    rules: List[Rule] = load_packaged_rules()
 
-    # basic lint: range must be parseable
-    try:
-        _ = parse_duration_to_seconds(rng)
-    except Exception:
-        warnings.append(f"Could not parse range {rng!r}; falling back to 5m.")
-        rng = "5m"
+    # Determine range (CLI override wins)
+    range_str = range_override or _extract_range_from_text(prompt, default="5m")
+    range_str = _validate_range(range_str, warnings)
 
-    # ---- RULE 1: High CPU pods ----
-    if ("cpu" in text or "씨피유" in text) and ("pod" in text or "파드" in text) and (
-        "90" in text or "high" in text or "over" in text or "넘" in text
-    ):
-        promql = (
-            f"topk(10, sum(rate({cpu_usage_metric}[{rng}])) by ({label_namespace}, {label_pod}))"
-        )
-        explain = (
-            "Intent: find top CPU pods.\n"
-            f"- Using rate({cpu_usage_metric}[{rng}]) as CPU usage rate\n"
-            f"- Summed by ({label_namespace}, {label_pod})\n"
-            "- topk(10, ...) to show most expensive pods"
-        )
-        return RuleResult(promql=promql, explain=explain, warnings=warnings, matched_rule="high_cpu_pods", confidence=0.78)
+    quantile = quantile_override if quantile_override is not None else _extract_quantile(prompt, default=0.95)
 
-    # ---- RULE 2: Memory high pods ----
-    if ("memory" in text or "mem" in text or "메모리" in text) and ("pod" in text or "파드" in text):
-        promql = f"topk(10, sum({mem_working_set_metric}) by ({label_namespace}, {label_pod}))"
-        explain = (
-            "Intent: find top memory pods.\n"
-            f"- Using {mem_working_set_metric} as working set bytes\n"
-            f"- Summed by ({label_namespace}, {label_pod})\n"
-            "- topk(10, ...) to show most expensive pods"
+    r = match_rule(prompt, rules)
+    if not r:
+        raise RuleMatchError(
+            "No rule matched your prompt yet. Try including intent words like "
+            "'cpu pod', 'memory pod', 'p95 latency by service', 'error rate by service', "
+            "and a range like 'last 30m'."
         )
-        return RuleResult(promql=promql, explain=explain, warnings=warnings, matched_rule="high_mem_pods", confidence=0.74)
 
-    # ---- RULE 3: Error rate (by service) ----
-    if ("error rate" in text or "5xx" in text or "에러율" in text or "오류율" in text) and (
-        "service" in text or "서비스" in text
-    ):
-        # Assumes http_requests_total has 'code' label; configurable via metric mapping.
-        promql = (
-            f"sum(rate({http_requests_total_metric}{{code=~\"5..\"}}[{rng}])) by ({label_service})"
-            f" / "
-            f"sum(rate({http_requests_total_metric}[{rng}])) by ({label_service})"
-        )
-        explain = (
-            "Intent: HTTP 5xx error rate by service.\n"
-            f"- Numerator: rate({http_requests_total_metric}{{code=~\"5..\"}}[{rng}]) by {label_service}\n"
-            f"- Denominator: rate({http_requests_total_metric}[{rng}]) by {label_service}\n"
-            "- Division gives error ratio per service"
-        )
-        return RuleResult(promql=promql, explain=explain, warnings=warnings, matched_rule="error_rate_by_service", confidence=0.80)
+    metrics: Dict[str, str] = {
+        "cpu_usage": cpu_usage_metric,
+        "mem_working_set": mem_working_set_metric,
+        "http_requests_total": http_requests_total_metric,
+        "http_duration_bucket": http_duration_bucket_metric,
+    }
+    labels: Dict[str, str] = {
+        "namespace": label_namespace,
+        "pod": label_pod,
+        "service": label_service,
+    }
 
-    # ---- RULE 4: pXX latency (by service) ----
-    if ("latency" in text or "지연" in text) and ("p" in text or "percentile" in text or "퍼센타일" in text):
-        q = _extract_quantile(prompt, default=0.95)
-        promql = (
-            f"histogram_quantile({q}, sum(rate({http_duration_bucket_metric}[{rng}])) by (le, {label_service}))"
-        )
-        explain = (
-            f"Intent: p{int(q*100)} latency by service.\n"
-            f"- histogram_quantile({q}, ...)\n"
-            f"- Buckets: rate({http_duration_bucket_metric}[{rng}])\n"
-            f"- Aggregated by (le, {label_service})"
-        )
-        return RuleResult(promql=promql, explain=explain, warnings=warnings, matched_rule="pXX_latency_by_service", confidence=0.82)
+    promql = render_template(
+        r.promql,
+        range_str=range_str,
+        quantile=float(quantile),
+        metrics=metrics,
+        labels=labels,
+    )
+    explain = render_template(
+        r.explain,
+        range_str=range_str,
+        quantile=float(quantile),
+        metrics=metrics,
+        labels=labels,
+    )
 
-    # ---- RULE 5: Request rate by service ----
-    if ("rps" in text or "request rate" in text or "요청" in text) and ("service" in text or "서비스" in text):
-        promql = f"sum(rate({http_requests_total_metric}[{rng}])) by ({label_service})"
-        explain = (
-            "Intent: request rate by service.\n"
-            f"- Using rate({http_requests_total_metric}[{rng}])\n"
-            f"- Summed by ({label_service})"
-        )
-        return RuleResult(promql=promql, explain=explain, warnings=warnings, matched_rule="request_rate_by_service", confidence=0.75)
-
-    raise RuleMatchError(
-        "No rule matched your prompt yet. Try including intent words like "
-        "'cpu pod', 'memory pod', 'p95 latency by service', 'error rate by service', "
-        "and a range like 'last 30m'."
+    return RuleResult(
+        promql=promql,
+        explain=explain,
+        warnings=warnings,
+        matched_rule=r.id,
+        confidence=r.confidence,
     )
