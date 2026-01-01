@@ -1,7 +1,0 @@
-site_name: PromQL Assistant CLI
-theme:
-  name: material
-nav:
-  - Home: index.md
-  - Cookbook: cookbook.md
-docs_dir: docs
