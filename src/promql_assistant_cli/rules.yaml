@@ -1,0 +1,63 @@
+version: 1
+
+rules:
+  - id: high_cpu_pods
+    keywords_all: ["cpu", "pod"]
+    keywords_any: ["high", "over", "top", "90", "95", "hot", "spike", "피크", "높", "넘", "파드", "씨피유"]
+    promql: "topk(10, sum(rate({metrics.cpu_usage}[{range}])) by ({labels.namespace}, {labels.pod}))"
+    explain: |
+      Intent: top CPU pods
+      - metric: {metrics.cpu_usage}
+      - range: {range}
+      - group by: {labels.namespace}, {labels.pod}
+      - topk(10): show most expensive pods
+    confidence: 0.78
+
+  - id: high_mem_pods
+    keywords_all: ["pod"]
+    keywords_any: ["memory", "mem", "ram", "메모리", "파드", "높", "over", "top"]
+    promql: "topk(10, sum({metrics.mem_working_set}) by ({labels.namespace}, {labels.pod}))"
+    explain: |
+      Intent: top memory pods
+      - metric: {metrics.mem_working_set}
+      - group by: {labels.namespace}, {labels.pod}
+      - topk(10): show most expensive pods
+    confidence: 0.74
+
+  - id: error_rate_by_service
+    keywords_all: ["service"]
+    keywords_any: ["error rate", "5xx", "error", "에러율", "오류율", "장애", "서비스"]
+    promql: |
+      sum(rate({metrics.http_requests_total}{code=~"5.."}[{range}])) by ({labels.service})
+      /
+      sum(rate({metrics.http_requests_total}[{range}])) by ({labels.service})
+    explain: |
+      Intent: HTTP 5xx error rate by service
+      - metric: {metrics.http_requests_total}
+      - numerator: 5xx only (code=~"5..")
+      - denominator: all requests
+      - group by: {labels.service}
+    confidence: 0.80
+
+  - id: pXX_latency_by_service
+    keywords_all: ["service"]
+    keywords_any: ["latency", "p95", "p99", "percentile", "지연", "퍼센타일", "서비스"]
+    promql: "histogram_quantile({quantile}, sum(rate({metrics.http_duration_bucket}[{range}])) by (le, {labels.service}))"
+    explain: |
+      Intent: pXX latency by service
+      - metric: {metrics.http_duration_bucket}
+      - quantile: {quantile}
+      - range: {range}
+      - group by: le, {labels.service}
+    confidence: 0.82
+
+  - id: request_rate_by_service
+    keywords_all: ["service"]
+    keywords_any: ["rps", "qps", "request rate", "traffic", "요청", "트래픽", "서비스"]
+    promql: "sum(rate({metrics.http_requests_total}[{range}])) by ({labels.service})"
+    explain: |
+      Intent: request rate by service
+      - metric: {metrics.http_requests_total}
+      - range: {range}
+      - group by: {labels.service}
+    confidence: 0.75
