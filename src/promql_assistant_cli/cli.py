@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from typing import Optional
 
 import typer
@@ -15,6 +16,7 @@ from .render import (
     print_json,
     print_prometheus_result_table,
     print_promql,
+    print_range_sparkline,
 )
 from .util import Paths
 
@@ -48,11 +50,16 @@ def _build_client(s: Settings, server_override: Optional[str]) -> Optional[Prome
 def ask(
     prompt: str = typer.Argument(..., help="Natural language prompt, e.g. 'p95 latency by service last 1h'"),
     server: Optional[str] = typer.Option(None, "--server", help="Prometheus base URL, e.g. http://localhost:9090"),
-    range: Optional[str] = typer.Option(None, "--range", help="Override time range, e.g. 30m (optional)"),
+    range: Optional[str] = typer.Option(None, "--range", help="Force range window, e.g. 30m (overrides prompt parsing)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print PromQL only (no Prometheus API call)"),
     explain: bool = typer.Option(False, "--explain", help="Show mapping logic"),
     validate: bool = typer.Option(False, "--validate", help="Validate PromQL via Prometheus API (requires --server or config)"),
-    format: str = typer.Option("table", "--format", help="Output format: table|json|promql"),
+    format: str = typer.Option("table", "--format", help="Output format: table|json|promql|spark"),
+    # Range query flags
+    start: Optional[int] = typer.Option(None, "--start", help="Range query start (unix seconds). If set, uses query_range."),
+    end: Optional[int] = typer.Option(None, "--end", help="Range query end (unix seconds). Default: now"),
+    step: str = typer.Option("30s", "--step", help="Range query step, e.g. 15s/30s/1m"),
+    spark_limit: int = typer.Option(10, "--spark-limit", help="Max series to show in spark output"),
 ):
     """
     Main entry: NL -> PromQL. Optionally validate / query Prometheus.
@@ -60,14 +67,10 @@ def ask(
     s = Settings.load()
     client = _build_client(s, server)
 
-    # If user provided --range, append into prompt for rule extraction
-    effective_prompt = prompt
-    if range:
-        effective_prompt = f"{prompt} last {range}"
-
     try:
         rr = convert_to_promql(
-            effective_prompt,
+            prompt,
+            range_override=range,
             cpu_usage_metric=s.metrics.cpu_usage,
             mem_working_set_metric=s.metrics.mem_working_set,
             http_requests_total_metric=s.metrics.http_requests_total,
@@ -80,22 +83,33 @@ def ask(
         err_console.print(f"[red]no_match:[/red] {e}")
         raise typer.Exit(code=1)
 
-    # format=promql implies dry output
+    # format=promql implies output only
     if format == "promql":
         print_promql(console, rr.promql)
         if explain:
             print_explain(console, rr.explain, rr.warnings)
         raise typer.Exit(code=0)
 
+    # dry run (no server needed)
     if dry_run:
         if format == "json":
-            print_json(console, {"promql": rr.promql, "explain": rr.explain if explain else None, "warnings": rr.warnings})
+            print_json(
+                console,
+                {
+                    "promql": rr.promql,
+                    "matched_rule": rr.matched_rule,
+                    "confidence": rr.confidence,
+                    "explain": rr.explain if explain else None,
+                    "warnings": rr.warnings,
+                },
+            )
         else:
             print_promql(console, rr.promql)
             if explain:
                 print_explain(console, rr.explain, rr.warnings)
         raise typer.Exit(code=0)
 
+    # validate
     if validate:
         if not client:
             err_console.print("[red]validate requires a Prometheus server.[/red] Use --server or set config.")
@@ -106,35 +120,67 @@ def ask(
             err_console.print(f"[red]invalid:[/red] {e}")
             raise typer.Exit(code=2)
 
-    # If no server, we can only output PromQL
+    # If no server, fallback to printing only
     if not client:
         if format == "json":
-            print_json(console, {"promql": rr.promql, "explain": rr.explain if explain else None, "warnings": rr.warnings})
+            print_json(
+                console,
+                {
+                    "promql": rr.promql,
+                    "matched_rule": rr.matched_rule,
+                    "confidence": rr.confidence,
+                    "explain": rr.explain if explain else None,
+                    "warnings": rr.warnings,
+                },
+            )
         else:
             print_promql(console, rr.promql)
             if explain:
                 print_explain(console, rr.explain, rr.warnings)
         raise typer.Exit(code=0)
 
-    # Query Prometheus (instant query)
+    # Optional: metric mismatch warnings when explain is on
+    if explain:
+        mismatch = client.warn_if_metrics_missing(
+            [s.metrics.cpu_usage, s.metrics.mem_working_set, s.metrics.http_requests_total, s.metrics.http_duration_bucket]
+        )
+        for w in mismatch:
+            rr.warnings.append(w)
+
+    # Choose instant vs range query
+    use_range = start is not None
     try:
-        data = client.query_instant(rr.promql)
+        if use_range:
+            start_ts = float(start)
+            end_ts = float(end) if end is not None else time.time()
+            data = client.query_range(rr.promql, start=start_ts, end=end_ts, step=step)
+        else:
+            data = client.query_instant(rr.promql)
     except PrometheusAPIError as e:
         err_console.print(f"[red]prometheus_error:[/red] {e}")
         err_console.print("[yellow]Tip:[/yellow] use --dry-run or --validate first.")
         raise typer.Exit(code=3)
 
     if format == "json":
-        out = {"promql": rr.promql, "result": data}
+        out = {"promql": rr.promql, "matched_rule": rr.matched_rule, "confidence": rr.confidence, "result": data}
         if explain:
             out["explain"] = rr.explain
             out["warnings"] = rr.warnings
         print_json(console, out)
-    else:
-        print_promql(console, rr.promql)
-        if explain:
-            print_explain(console, rr.explain, rr.warnings)
-        print_prometheus_result_table(console, data)
+        return
+
+    # default/table output
+    print_promql(console, rr.promql)
+    if explain:
+        print_explain(console, rr.explain, rr.warnings)
+
+    # spark output (range query recommended)
+    if format == "spark":
+        print_range_sparkline(console, data, limit=spark_limit)
+        return
+
+    # table output
+    print_prometheus_result_table(console, data)
 
 
 @app.command("suggest")
@@ -180,7 +226,6 @@ def suggest(
     if format == "json":
         print_json(console, {"what": what, "items": items})
     else:
-        # simple list table
         from rich.table import Table
 
         t = Table(show_header=True, header_style="bold")
@@ -199,6 +244,7 @@ def config_path():
 @app.command("version")
 def version():
     from . import __version__
+
     console.print(__version__)
 
 
@@ -211,7 +257,7 @@ def main(ctx: typer.Context, prompt: Optional[str] = typer.Argument(None)):
     if ctx.invoked_subcommand is not None:
         return
     if not prompt:
-        err_console.print("Usage: promql-assistant ask \"...\"  (or just promql-assistant \"...\")")
+        err_console.print('Usage: promql-assistant ask "..."  (or just promql-assistant "...")')
         raise typer.Exit(code=1)
     # Re-dispatch
     sys.argv = [sys.argv[0], "ask", prompt]
