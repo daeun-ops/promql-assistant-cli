@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -15,6 +15,8 @@ class PrometheusClient:
     timeout_seconds: float = 10.0
     bearer_token: Optional[str] = None
     basic_auth: Optional[Tuple[str, str]] = None
+
+    _metric_cache: Optional[set[str]] = field(default=None, init=False, repr=False)
 
     def _headers(self) -> Dict[str, str]:
         h: Dict[str, str] = {"Accept": "application/json"}
@@ -37,7 +39,9 @@ class PrometheusClient:
         except Exception as e:
             raise PrometheusAPIError(f"Prometheus request failed: GET {path} ({e})") from e
 
-        if not isinstance(data, dict) or data.get("status") != "success":
+        if not isinstance(data, dict):
+            raise PrometheusAPIError(f"Prometheus API returned non-JSON object: {data}")
+        if data.get("status") != "success":
             raise PrometheusAPIError(f"Prometheus API error: {data}")
         return data
 
@@ -55,7 +59,6 @@ class PrometheusClient:
 
     def validate_promql(self, promql: str) -> None:
         # Use query endpoint to force PromQL parse/validation.
-        # If query is invalid, Prometheus returns status=error (non-success).
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
                 r = client.get(
@@ -64,7 +67,6 @@ class PrometheusClient:
                     headers=self._headers(),
                     auth=self._auth(),
                 )
-                # Prometheus returns 200 with {"status":"error"} for parse errors
                 data = r.json()
         except Exception as e:
             raise PrometheusAPIError(f"Validation request failed: {e}") from e
@@ -74,7 +76,6 @@ class PrometheusClient:
         if data.get("status") == "success":
             return
 
-        # status=error
         err_type = data.get("errorType")
         err = data.get("error")
         raise ValidationError(f"PromQL validation failed ({err_type}): {err}")
@@ -95,3 +96,33 @@ class PrometheusClient:
         data = self._get(f"/api/v1/label/{label}/values")
         values = data.get("data", [])
         return list(values) if isinstance(values, list) else []
+
+    # ---- ops guardrails ----
+
+    def _ensure_metric_cache(self) -> None:
+        if self._metric_cache is None:
+            names = self.metric_names()
+            self._metric_cache = set(str(x) for x in names)
+
+    def metric_exists(self, name: str) -> bool:
+        self._ensure_metric_cache()
+        return name in (self._metric_cache or set())
+
+    def warn_if_metrics_missing(self, names: List[str]) -> List[str]:
+        """
+        Returns warnings if configured metrics do not exist on this Prometheus.
+        (Best-effort: relies on metric name list endpoint)
+        """
+        warnings: List[str] = []
+        try:
+            self._ensure_metric_cache()
+        except Exception:
+            return warnings
+
+        for n in names:
+            if n and not self.metric_exists(n):
+                warnings.append(
+                    f"Configured metric '{n}' not found on this Prometheus. "
+                    "Check your metric catalog in config.toml."
+                )
+        return warnings
